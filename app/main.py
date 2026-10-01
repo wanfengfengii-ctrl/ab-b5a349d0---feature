@@ -29,7 +29,14 @@ async def schema_hint() -> dict:
     """返回输入输出字段约定，便于调用方自查。"""
     return {
         "request": {
-            "segment_lengths": "6..12 个正整数，按顺序排列的缆段长度",
+            "segment_lengths": "6..12 个正整数，按顺序排列的缆段名义长度",
+            "length_intervals": (
+                "可选；与 segment_lengths 等长的正整数闭区间数组，"
+                '每项 {"min": int, "max": int}（min<=max）。'
+                "未提交时按 segment_lengths 固定长度求解并返回固定长度响应；"
+                "提交后进入稳健模式：每个观测窗对各段长度在各自区间内的"
+                "任意独立取值都必须成立"
+            ),
             "strain_bounds": {"min": "整数微应变闭区间下端", "max": "上端"},
             "windows": [
                 {
@@ -42,20 +49,37 @@ async def schema_hint() -> dict:
             "window_count": "8..20",
         },
         "success_response": {
+            "mode": (
+                "仅稳健模式（提交 length_intervals）返回，值为 robust_interval；"
+                "固定长度模式不含此字段"
+            ),
             "segment_count": "int",
-            "strains": "逐段整数微应变（字典序最优）",
+            "length_intervals": "robust_interval 模式下回显提交的逐段长度闭区间",
+            "strains": "逐段整数微应变（稳健可行域内三级字典序最优）",
             "adjacent_diffs": "逐相邻段应变差，可直接复核两级平滑指标",
             "objectives": {
                 "max_adjacent_diff": "第一级指标 = max(|adjacent_diffs|)",
                 "sum_adjacent_abs_diff": "第二级指标 = sum(|adjacent_diffs|)",
             },
-            "window_checks": [
-                {
-                    "weighted_strain_sum": "= Σ 窗内长度×应变，须落入提交的闭区间",
-                    "total_length": "= Σ 窗内段长",
+            "window_checks": {
+                "fixed_length": {
+                    "weighted_strain_sum": "= Σ 窗内名义长度×应变，须落入提交闭区间",
+                    "total_length": "= Σ 窗内名义段长",
                     "satisfied": "min<=weighted_strain_sum<=max",
-                }
-            ],
+                },
+                "robust_interval": {
+                    "robust_min_weighted_sum": (
+                        "按应变符号取长度端点得到的窗内最小可能回算和（精确整数）"
+                    ),
+                    "robust_max_weighted_sum": "窗内最大可能回算和（精确整数）",
+                    "min_extremum_lengths": (
+                        "取得最小极值时各段（按窗内段序）所用长度端点见证"
+                    ),
+                    "max_extremum_lengths": "取得最大极值时的长度端点见证",
+                    "total_length_interval": "窗内总长度闭区间 [Σmin, Σmax]",
+                    "robustly_satisfied": "min<=robust_min 且 robust_max<=max",
+                },
+            },
             "criteria_order": [
                 "max_adjacent_diff",
                 "sum_adjacent_abs_diff",
@@ -64,7 +88,8 @@ async def schema_hint() -> dict:
         },
         "errors": {
             "INVALID_INPUT": {"fields": [{"field": "字段路径", "message": "原因"}]},
-            "INFEASIBLE": "观测窗彼此冲突，不存在满足全部闭区间的整数应变序列",
+            "INFEASIBLE": "输入合法，但不存在满足全部闭区间的整数应变序列"
+            "（稳健模式下指不存在对长度盒内任意独立取值都成立的序列）",
         },
     }
 

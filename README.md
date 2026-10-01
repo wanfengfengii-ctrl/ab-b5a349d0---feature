@@ -6,12 +6,35 @@
 
 ## 数学模型与优选准则
 
-设第 i 段长度为 L_i、待求整数微应变为 x_i。每个观测窗 [s,e] 要求
+设第 i 段名义长度为 L_i、待求整数微应变为 x_i。每个观测窗 [s,e] 要求
 
     Σ_{i=s..e} L_i · x_i ∈ [min_elongation, max_elongation]
 
 且每段都满足统一应变闭区间 `strain_bounds.min ≤ x_i ≤ strain_bounds.max`。
 所有运算与比较均为 Python 任意精度**整数**，无任何浮点参与。
+
+### 可选：逐段稳健长度区间 `length_intervals`
+
+可在请求中为每根缆段可选提交一个正整数长度闭区间
+`length_intervals[i] = {"min": a_i, "max": b_i}`（与 `segment_lengths` 等长）。
+- **不提交**：按 `segment_lengths` 固定长度求解，请求与响应完全保持原样。
+- **提交**：进入稳健模式，每个观测窗必须对各段长度在各自区间内的**任意
+  独立取值**都满足伸长闭区间（不是只在名义长度处成立，也不做事后抽查）。
+
+对给定应变 x，记窗内段集为 w。线性函数在整数长度盒上的极值必在顶点取得，
+故窗的最小/最大可能回算和（精确整数）为：
+
+    F_min(x) = Σ_{i∈w, x_i≥0} a_i·x_i + Σ_{i∈w, x_i<0} b_i·x_i
+    F_max(x) = Σ_{i∈w, x_i≥0} b_i·x_i + Σ_{i∈w, x_i<0} a_i·x_i
+
+稳健要求即 `F_min ≥ min_elongation` 且 `F_max ≤ max_elongation`。响应逐窗
+返回这两个极值及取得极值时各段所用的长度端点见证
+`min_extremum_lengths` / `max_extremum_lengths`（按窗内段序），可由请求
+数据与返回应变直接复核；合法但不存在稳健解时返回 `409 INFEASIBLE`。
+稳健求解按每段应变正负穷举至多 2^n 个符号分支（n≤12，完整覆盖长度盒），
+分支内复用与固定长度相同的差分闭包缩域、整数界传播与 MRV/折半回溯。
+
+### 三级优选（两种模式共用）
 
 可行解依次最小化（三级字典序，前一级最优后才比较下一级）：
 
@@ -41,9 +64,11 @@ curl -s http://localhost:9000/health
 
 `verify` 服务会等待 `api` 健康检查通过，然后依次运行：
 
-1. 单元测试（pytest，含与全枚举暴力解的三级最优性对照）
+1. 单元测试（pytest，含固定长度与稳健长度区间两种模式对全枚举暴力解的
+   三级最优性对照、稳健极值/见证复核、字段校验）
 2. 构建检查（`compileall`）与 `pip check`
-3. 一组反演 API 冒烟（成功回算、`INFEASIBLE`、`INVALID_INPUT`）
+3. 一组反演 API 冒烟：固定长度兼容、稳健成功（极值与端点见证复核）、
+   稳健不可行（`INFEASIBLE`）、非法长度区间（`INVALID_INPUT`）
 
 完成后**自行退出**，退出码即结论（0 为全部通过）：
 
@@ -70,6 +95,10 @@ echo "verify exit code: $?"
 ```json
 {
   "segment_lengths": [10, 12, 11, 13, 10, 14],
+  "length_intervals": [
+    {"min": 9, "max": 11}, {"min": 11, "max": 13}, {"min": 10, "max": 12},
+    {"min": 12, "max": 14}, {"min": 9, "max": 11}, {"min": 13, "max": 15}
+  ],
   "strain_bounds": {"min": -100, "max": 100},
   "windows": [
     {"start_segment": 1, "end_segment": 6,
@@ -78,12 +107,15 @@ echo "verify exit code: $?"
 }
 ```
 
-- `segment_lengths`：6–12 个正整数，按顺序排列。
+- `segment_lengths`：6–12 个正整数，按顺序排列的名义长度。
+- `length_intervals`：**可选**；与 `segment_lengths` 等长的正整数闭区间，
+  每项 `{"min": a, "max": b}` 且 `1 ≤ a ≤ b`。未提交/为 null 时按固定
+  名义长度求解；提交后进入稳健模式。非法项定位到 `length_intervals[i].min/max`。
 - `strain_bounds`：统一应变闭区间（整数微应变）。
 - `windows`：8–20 个观测窗；段号 1 基且含端点，`start ≤ end`，
   `min_elongation ≤ max_elongation`。
 
-成功（200）：
+成功（200，固定长度模式，结构与未启用区间时完全一致）：
 
 ```json
 {
@@ -118,12 +150,57 @@ echo "verify exit code: $?"
 `strains` 直接复核并确认落在提交闭区间内；两级平滑指标可用
 `adjacent_diffs` 直接复核。
 
+成功（200，稳健模式，提交了 `length_intervals`）：
+
+```json
+{
+  "code": "OK",
+  "result": {
+    "mode": "robust_interval",
+    "segment_count": 6,
+    "length_intervals": [[9, 11], [11, 13], [10, 12], [12, 14], [9, 11], [13, 15]],
+    "strains": [3, 3, 3, 3, 3, 3],
+    "adjacent_diffs": [0, 0, 0, 0, 0],
+    "objectives": {"max_adjacent_diff": 0, "sum_adjacent_abs_diff": 0},
+    "window_checks": [
+      {
+        "index": 0,
+        "start_segment": 1,
+        "end_segment": 6,
+        "total_length_interval": [64, 76],
+        "min_elongation": 100,
+        "max_elongation": 400,
+        "robust_min_weighted_sum": 192,
+        "robust_max_weighted_sum": 228,
+        "min_extremum_lengths": [9, 11, 10, 12, 9, 13],
+        "max_extremum_lengths": [11, 13, 12, 14, 11, 15],
+        "robustly_satisfied": true
+      }
+    ],
+    "criteria_order": ["max_adjacent_diff",
+                       "sum_adjacent_abs_diff", "lexicographic"]
+  }
+}
+```
+
+稳健模式下每个窗给出：
+
+- `robust_min_weighted_sum` / `robust_max_weighted_sum`：对各段长度在区间内
+  任意独立取值时，该窗回算和的精确最小/最大值（按返回应变的正负取端点）；
+- `min_extremum_lengths` / `max_extremum_lengths`：取得相应极值时，窗内各段
+  （按 start→end 顺序）实际使用的长度端点见证，全部是提交的 `min` 或 `max`；
+- `total_length_interval`：窗内总长度闭区间 `[Σmin, Σmax]`；
+- 恒有 `min_elongation ≤ robust_min_weighted_sum` 且
+  `robust_max_weighted_sum ≤ max_elongation`，可用请求数据与 `strains`
+  逐窗直接复核，无需信任服务。
+
 错误：
 
 - `400`：请求体不是合法 JSON。
-- `422 INVALID_INPUT`：字段错误，`fields[]` 逐条给出 `field` 与 `message`。
-- `409 INFEASIBLE`：输入合法但观测窗彼此冲突（含与统一应变界冲突），
-  不存在满足全部闭区间的整数应变序列。
+- `422 INVALID_INPUT`：字段错误，`fields[]` 逐条给出 `field` 与 `message`
+  （非法长度区间定位到 `length_intervals[i].min/max`）。
+- `409 INFEASIBLE`：输入合法但不存在满足全部闭区间的整数应变序列；稳健
+  模式下指不存在对长度盒内任意独立取值都成立的序列。
 
 ## 本地开发（无 Docker）
 

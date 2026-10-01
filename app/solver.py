@@ -2,7 +2,9 @@
 
 输入
 ----
-- 6..12 段按顺序排列的缆段长度（正整数）
+- 6..12 段按顺序排列的缆段名义长度（正整数）
+- 可选的每段长度正整数闭区间 length_intervals（提交后进入稳健模式：
+  每个观测窗对各段长度在区间内任意独立取值都须成立）
 - 统一应变闭区间 [strain_min, strain_max]（整数微应变）
 - 8..20 个观测窗，每窗给出连续起止段（1 基，含端点）与累计伸长量闭区间
 
@@ -36,6 +38,7 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 MIN_SEGMENTS = 6
@@ -127,6 +130,65 @@ def _validate_strain_bounds(
     return (lo, hi) if ok else None
 
 
+def _validate_length_intervals(
+    payload: dict, n: int | None, fields: list[dict[str, str]]
+) -> list[tuple[int, int]] | None:
+    """可选的逐段长度闭区间（正整数）；未提交返回 None（固定长度模式）。"""
+    if "length_intervals" not in payload:
+        return None
+    raw = payload["length_intervals"]
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        _err(
+            fields,
+            "length_intervals",
+            "must be an array of {\"min\": positive int, \"max\": positive int}",
+        )
+        return None
+    intervals: list[tuple[int, int]] = []
+    all_ok = True
+    if n is not None and len(raw) != n:
+        _err(
+            fields,
+            "length_intervals",
+            f"must contain one interval per segment (expected {n}, got {len(raw)})",
+        )
+    for i, item in enumerate(raw):
+        prefix = f"length_intervals[{i}]"
+        if not isinstance(item, dict):
+            _err(fields, prefix, 'must be an object {"min": int, "max": int}')
+            all_ok = False
+            continue
+        ok = True
+        for key in ("min", "max"):
+            if key not in item:
+                _err(fields, f"{prefix}.{key}", "field is required")
+                ok = False
+            elif not _is_int(item[key]):
+                _err(fields, f"{prefix}.{key}", "must be an integer")
+                ok = False
+            elif item[key] < 1:
+                _err(fields, f"{prefix}.{key}", "must be a positive integer")
+                ok = False
+        for key in item:
+            if key not in ("min", "max"):
+                _err(fields, f"{prefix}.{key}", "unknown field")
+                ok = False
+        if ok and item["min"] > item["max"]:
+            _err(fields, f"{prefix}.min", "must be less than or equal to max")
+            ok = False
+        if ok:
+            intervals.append((item["min"], item["max"]))
+        else:
+            all_ok = False
+    if not all_ok:
+        return None
+    if n is not None and len(intervals) != n:
+        return None
+    return intervals
+
+
 def _validate_windows(
     payload: dict, n: int | None, fields: list[dict[str, str]]
 ) ->list[Window] | None:
@@ -195,11 +257,22 @@ def _validate_windows(
     return windows if all_ok else None
 
 
-_ALLOWED_TOP_LEVEL = {"segment_lengths", "strain_bounds", "windows"}
+_ALLOWED_TOP_LEVEL = {
+    "segment_lengths",
+    "length_intervals",
+    "strain_bounds",
+    "windows",
+}
 
 
-def validate(payload: object) -> tuple[list[int], int, int, list[Window]]:
-    """校验并归一化输入；非法时抛 ValidationErrors。"""
+def validate(
+    payload: object,
+) -> tuple[list[int], list[tuple[int, int]] | None, int, int, list[Window]]:
+    """校验并归一化输入；非法时抛 ValidationErrors。
+
+    返回 (名义长度, 可选长度区间, 应变下界, 应变上界, 观测窗)。
+    未提交 length_intervals 时第二元素为 None，调用方须保持固定长度语义。
+    """
     fields: list[dict[str, str]] = []
     if not isinstance(payload, dict):
         raise ValidationErrors(
@@ -209,13 +282,14 @@ def validate(payload: object) -> tuple[list[int], int, int, list[Window]]:
         if key not in _ALLOWED_TOP_LEVEL:
             _err(fields, key, "unknown field")
     lengths = _validate_lengths(payload, fields)
-    bounds = _validate_strain_bounds(payload, fields)
     n = len(lengths) if lengths is not None else None
+    intervals = _validate_length_intervals(payload, n, fields)
+    bounds = _validate_strain_bounds(payload, fields)
     windows = _validate_windows(payload, n, fields)
     if fields:
         raise ValidationErrors(fields)
     assert lengths is not None and bounds is not None and windows is not None
-    return lengths, bounds[0], bounds[1], windows
+    return lengths, intervals, bounds[0], bounds[1], windows
 
 
 # --------------------------------------------------------------------------- #
@@ -442,8 +516,29 @@ def _abs_sum_constraints(n: int, m: int, s_lo: int | None, s_hi: int | None) -> 
 
 
 def invert_payload(payload: object) -> dict:
-    """完整反演，返回可直接复核的结果字典；校验失败/不可行抛对应异常。"""
-    lengths, strain_min, strain_max, windows = validate(payload)
+    """完整反演，返回可直接复核的结果字典；校验失败/不可行抛对应异常。
+
+    未提交 ``length_intervals`` 时严格保持原有固定长度语义与响应结构；
+    提交后切换为稳健模式：每个观测窗对长度盒内任意独立取值都必须成立。
+    """
+    lengths, intervals, strain_min, strain_max, windows = validate(payload)
+    if intervals is None:
+        strains, diffs, best_m, best_s = _solve_fixed(
+            lengths, strain_min, strain_max, windows
+        )
+        return _build_fixed_result(lengths, windows, strains, diffs, best_m, best_s)
+    strains, diffs, best_m, best_s = _solve_robust(
+        lengths, intervals, strain_min, strain_max, windows
+    )
+    return _build_robust_result(
+        lengths, intervals, windows, strains, diffs, best_m, best_s
+    )
+
+
+def _solve_fixed(
+    lengths: list[int], strain_min: int, strain_max: int, windows: list[Window]
+) -> tuple[list[int], list[int], int, int]:
+    """固定名义长度下的三级字典序最优反演（原逻辑）。"""
     n = len(lengths)
     window_cons = _window_constraints(n, lengths, windows)
 
@@ -524,10 +619,255 @@ def invert_payload(payload: object) -> dict:
         x_lo, x_hi = narrowed
 
     diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
-    return _build_result(lengths, windows, strains, diffs, best_m, best_s)
+    return strains, diffs, best_m, best_s
+# 稳健模式：符号分支穷举
+# --------------------------------------------------------------------------- #
+# 给定 x 时窗 w 的稳健极值回算和是分段线性（精确整数）：
+#   F_min(x)=Σ_{x_i≥0}a_i x_i+Σ_{x_i<0}b_i x_i ≥ lo
+#   F_max(x)=Σ_{x_i≥0}b_i x_i+Σ_{x_i<0}a_i x_i ≤ hi
+# 线性函数在整数盒上极值必在顶点取得，故对“各段长度在各自区间内任意独立
+# 取值”充分必要。按每段应变正负把可行集切成至多 2^n 个符号分支（n≤12，
+# ≤4096 个，完整覆盖而非抽查长度组合）；每分支内 F_min/F_max 均为普通线性
+# 整数区间约束，复用固定长度求解器同一套传播/回溯。
+def _sign_window_constraints(
+    n: int,
+    intervals: list[tuple[int, int]],
+    windows: list[Window],
+    sign: tuple[bool, ...],
+) -> list[Constraint]:
+    """固定符号（True:x_i≥0 / False:x_i≤-1）下的稳健窗线性约束。"""
+    cons: list[Constraint] = []
+    for win in windows:
+        min_terms = tuple(
+            (i, intervals[i][0] if sign[i] else intervals[i][1])
+            for i in range(win.start, win.end + 1)
+        )
+        max_terms = tuple(
+            (i, intervals[i][1] if sign[i] else intervals[i][0])
+            for i in range(win.start, win.end + 1)
+        )
+        cons.append((min_terms, win.lo, None))
+        cons.append((max_terms, None, win.hi))
+    return cons
 
 
-def _build_result(
+def _solve_robust(
+    nominal: list[int],
+    intervals: list[tuple[int, int]],
+    strain_min: int,
+    strain_max: int,
+    windows: list[Window],
+) -> tuple[list[int], list[int], int, int]:
+    """长度区间稳健模式下的三级字典序最优反演。"""
+    n = len(nominal)
+    full_range = strain_max - strain_min
+    patterns = list(itertools.product((True, False), repeat=n))
+
+    # 与 M、S 无关的稳健窗可行性先全符号分支筛一次。每分支有两组线性系数
+    # （下界窗系数 cmin、上界窗系数 cmax），分别在“双侧窗区间”上做前缀差分
+    # 闭包并取交集，得到该符号分支内既保留 Σcmin·x≥lo 强下界、又保留
+    # Σcmax·x≤hi 强上界的精确一元域（与固定长度求解器的前缀闭包同强度）。
+    # 结果与 M/S 无关，只算一次；后续所有判定只枚举幸存符号分支。
+    sign_base: dict[tuple[bool, ...], tuple[list[int], list[int]]] = {}
+
+    def one_sided_x_bounds(
+        coeff: list[int], use_lower: bool
+    ) -> tuple[list[int], list[int]] | None:
+        """仅并入下界窗（Σcoeff·x≥lo）或上界窗（Σcoeff·x≤hi）的前缀闭包。
+
+        直接构造差分边，避免用极大哨兵区间；保持全程任意精度整数。
+        """
+        edges: list[tuple[int, int, int]] = []
+        for i, length in enumerate(coeff):
+            edges.append((i, i + 1, length * strain_min))
+            edges.append((i + 1, i, -length * strain_max))
+        for win in windows:
+            if use_lower:
+                edges.append((win.start, win.end + 1, win.lo))
+            else:
+                edges.append((win.end + 1, win.start, -win.hi))
+        closure = _longest_path_closure(n + 1, edges)
+        if closure is None:
+            return None
+        return _x_bounds_from_prefix(n, coeff, strain_min, strain_max, closure)
+
+    for sign in patterns:
+        cmin = [intervals[i][0] if sign[i] else intervals[i][1] for i in range(n)]
+        cmax = [intervals[i][1] if sign[i] else intervals[i][0] for i in range(n)]
+        # cmin 只承载下界窗 Σcmin·x≥lo；cmax 只承载上界窗 Σcmax·x≤hi。
+        bmin = one_sided_x_bounds(cmin, True)
+        bmax = one_sided_x_bounds(cmax, False)
+        if bmin is None or bmax is None:
+            continue
+        x_lo: list[int] = []
+        x_hi: list[int] = []
+        ok = True
+        for i in range(n):
+            lo = max(bmin[0][i], bmax[0][i], 0 if sign[i] else strain_min)
+            hi = min(bmin[1][i], bmax[1][i], strain_max if sign[i] else -1)
+            if lo > hi:
+                ok = False
+                break
+            x_lo.append(lo)
+            x_hi.append(hi)
+        if ok:
+            # 再跑一次含全部窗约束（下界与上界同系数）的通用线性传播，补上
+            # 两个前缀闭包无法单独表达的“联合剪枝”；两者取强。
+            seed_lo = [0 if sign[i] else strain_min for i in range(n)]
+            seed_hi = [strain_max if sign[i] else -1 for i in range(n)]
+            joint = _propagate(
+                seed_lo, seed_hi, _sign_window_constraints(n, intervals, windows, sign)
+            )
+            if joint is not None:
+                x_lo = [max(x_lo[i], joint[0][i]) for i in range(n)]
+                x_hi = [min(x_hi[i], joint[1][i]) for i in range(n)]
+                if all(x_lo[i] <= x_hi[i] for i in range(n)):
+                    sign_base[sign] = (x_lo, x_hi)
+    if not sign_base:
+        raise InfeasibleError(
+            "no strain sequence is robustly feasible for the submitted length intervals"
+        )
+
+    def pattern_setup(
+        sign: tuple[bool, ...],
+        m: int,
+        s_lo: int | None,
+        s_hi: int | None,
+        fixed_eq: list[Constraint],
+        upper: tuple[int, int] | None,
+    ) -> tuple[list[int], list[int], list[Constraint], int] | None:
+        """构建并纯传播一个符号分支；返回收紧后域、约束与域总宽。"""
+        base_lo, base_hi = sign_base[sign]
+        # 关键：在“已含稳健窗”的一元域上跑 |Δ|≤M 差分闭包，得到窗与平滑
+        # 联合的传递收紧（等价于固定长度求解器先做窗口前缀闭包再并入 M）。
+        pattern_closure = _x_diff_closure(n, base_lo, base_hi, m)
+        if pattern_closure is None:
+            return None
+        c_lo, c_hi = pattern_closure
+        x_lo: list[int] = []
+        x_hi: list[int] = []
+        for i in range(n):
+            lo = c_lo[i]
+            hi = c_hi[i]
+            if lo > hi:
+                return None
+            x_lo.append(lo)
+            x_hi.append(hi)
+        cons = _sign_window_constraints(n, intervals, windows, sign)
+        cons += _diff_constraints(n, m)
+        use_s = s_lo is not None or s_hi is not None
+        if use_s:
+            x_lo = x_lo + [0] * (n - 1)
+            x_hi = x_hi + [m] * (n - 1)
+            cons += _abs_sum_constraints(n, m, s_lo, s_hi)
+        cons += fixed_eq
+        if upper is not None:
+            cons += [(((upper[0], 1),), None, upper[1])]
+        narrowed = _propagate(list(x_lo), list(x_hi), cons)
+        if narrowed is None:
+            return None
+        nlo, nhi = narrowed
+        width = sum(nhi[i] - nlo[i] for i in range(n))
+        return nlo, nhi, cons, width
+
+    def feasible(
+        m: int,
+        s_lo: int | None = None,
+        s_hi: int | None = None,
+        fixed_eq: list[Constraint] | None = None,
+        upper: tuple[int, int] | None = None,
+    ) -> tuple[int, ...] | None:
+        """跨符号分支：先纯传播筛掉不可行分支，幸存分支按收紧域总宽排序
+        （最紧、最易成功的先搜），再依次精确回溯，首个可行即返回。"""
+        fixed_eq = fixed_eq or []
+        # 已钉死前缀（及上界 t<0）直接确定部分段符号，先据此剪符号分支。
+        forced_sign: dict[int, bool] = {}
+        for terms, lo, hi in fixed_eq:
+            if lo is not None and lo == hi and len(terms) == 1:
+                var = terms[0][0]
+                forced_sign[var] = lo >= 0
+        if upper is not None and upper[1] < 0:
+            forced_sign[upper[0]] = False
+        survivors: list[tuple[int, list[int], list[int], list[Constraint]]] = []
+        for sign, base in sign_base.items():
+            if any(sign[i] != want for i, want in forced_sign.items()):
+                continue
+            setup = pattern_setup(sign, m, s_lo, s_hi, fixed_eq, upper)
+            if setup is not None:
+                x_lo, x_hi, cons, width = setup
+                survivors.append((width, x_lo, x_hi, cons))
+        survivors.sort(key=lambda z: z[0])
+        for _width, x_lo, x_hi, cons in survivors:
+            found = _search(list(x_lo), list(x_hi), cons)
+            if found is not None:
+                return found
+        return None
+
+    # 阶段 0：无平滑约束下的稳健整数可行性。
+    if feasible(full_range) is None:
+        raise InfeasibleError(
+            "no strain sequence is robustly feasible for the submitted length intervals"
+        )
+
+    # 阶段 1：二分最小可行 M（跨所有符号分支，关于 M 单调）。
+    m_lo, m_hi = 0, full_range
+    while m_lo < m_hi:
+        mid = (m_lo + m_hi) // 2
+        if feasible(mid) is not None:
+            m_hi = mid
+        else:
+            m_lo = mid + 1
+    best_m = m_lo
+
+    # 阶段 2：二分最小可行 S = Σ|Δ_k|。先取一个 M* 可行见证，以其实际 S
+    # 作为上界（远紧于 (n-1)·M*），减少二分次数与每次的回溯规模。
+    m_witness = feasible(best_m)
+    assert m_witness is not None
+    mw = list(m_witness[:n])
+    s_upper = sum(abs(mw[k] - mw[k - 1]) for k in range(1, n))
+    s_lo, s_hi = 0, s_upper
+    while s_lo < s_hi:
+        mid = (s_lo + s_hi) // 2
+        if feasible(best_m, s_hi=mid) is not None:
+            s_hi = mid
+        else:
+            s_lo = mid + 1
+    best_s = s_lo
+
+    # 阶段 3：逐段钉死全局字典序最小值。x_var≤t 的可行性关于 t 单调；
+    # 已固定前缀以等式约束随每步一起下发，跨所有符号分支取见证。先用阶段 2
+    # 的一个可行见证收紧每段上界（其逐段值即字典序上界），减少二分跨度。
+    witness = feasible(best_m, best_s, best_s)
+    assert witness is not None
+    incumbent = list(witness[:n])
+    fixed_eq: list[Constraint] = []
+    strains: list[int] = []
+    any_closure = _x_diff_closure(n, [strain_min] * n, [strain_max] * n, best_m)
+    assert any_closure is not None
+    var_lo_all, var_hi_all = any_closure
+    for var in range(n):
+        t_lo = var_lo_all[var]
+        t_hi = min(var_hi_all[var], incumbent[var])
+        while t_lo < t_hi:
+            mid = (t_lo + t_hi) // 2
+            found = feasible(
+                best_m, best_s, best_s, fixed_eq, upper=(var, mid)
+            )
+            if found is not None:
+                t_hi = mid
+                incumbent = list(found[:n])
+            else:
+                t_lo = mid + 1
+        strains.append(t_lo)
+        fixed_eq.append((((var, 1),), t_lo, t_lo))
+
+    diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
+    return strains, diffs, best_m, best_s
+
+
+
+
+def _build_fixed_result(
     lengths: list[int],
     windows: list[Window],
     strains: list[int],
@@ -562,6 +902,81 @@ def _build_result(
     assert recomputed_m == best_m and recomputed_s == best_s
     return {
         "segment_count": len(lengths),
+        "strains": strains,
+        "adjacent_diffs": diffs,
+        "objectives": {
+            "max_adjacent_diff": recomputed_m,
+            "sum_adjacent_abs_diff": recomputed_s,
+        },
+        "window_checks": window_checks,
+        "criteria_order": [
+            "max_adjacent_diff",
+            "sum_adjacent_abs_diff",
+            "lexicographic",
+        ],
+    }
+
+
+def _build_robust_result(
+    nominal: list[int],
+    intervals: list[tuple[int, int]],
+    windows: list[Window],
+    strains: list[int],
+    diffs: list[int],
+    best_m: int,
+    best_s: int,
+) -> dict:
+    """稳健模式结果：每窗给出精确整数极值回算和与取得极值的长度端点见证。"""
+    n = len(nominal)
+    window_checks: list[dict] = []
+    for idx, win in enumerate(windows):
+        f_min = 0
+        f_max = 0
+        total_lo = 0
+        total_hi = 0
+        min_witness: list[int] = []
+        max_witness: list[int] = []
+        for i in range(win.start, win.end + 1):
+            a, b = intervals[i]
+            x = strains[i]
+            total_lo += a
+            total_hi += b
+            if x >= 0:  # 非负应变：长度越大和越大
+                f_min += a * x
+                f_max += b * x
+                min_witness.append(a)
+                max_witness.append(b)
+            else:  # 负应变：长度越大和越小
+                f_min += b * x
+                f_max += a * x
+                min_witness.append(b)
+                max_witness.append(a)
+        satisfied = win.lo <= f_min and f_max <= win.hi
+        assert satisfied, "solver returned a non-robust strain sequence"
+        window_checks.append(
+            {
+                "index": idx,
+                "start_segment": win.start + 1,
+                "end_segment": win.end + 1,
+                "total_length_interval": [total_lo, total_hi],
+                "min_elongation": win.lo,
+                "max_elongation": win.hi,
+                "robust_min_weighted_sum": f_min,
+                "robust_max_weighted_sum": f_max,
+                # 按窗内段序（start_segment..end_segment）给出取得对应极值时
+                # 各段所用的长度端点，可与应变逐段相乘直接复核极值。
+                "min_extremum_lengths": min_witness,
+                "max_extremum_lengths": max_witness,
+                "robustly_satisfied": satisfied,
+            }
+        )
+    recomputed_m = max(abs(d) for d in diffs)
+    recomputed_s = sum(abs(d) for d in diffs)
+    assert recomputed_m == best_m and recomputed_s == best_s
+    return {
+        "mode": "robust_interval",
+        "segment_count": n,
+        "length_intervals": [[a, b] for a, b in intervals],
         "strains": strains,
         "adjacent_diffs": diffs,
         "objectives": {
