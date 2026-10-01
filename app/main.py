@@ -30,6 +30,12 @@ async def schema_hint() -> dict:
     return {
         "request": {
             "segment_lengths": "6..12 个正整数，按顺序排列的缆段长度",
+            "segment_length_intervals": (
+                "可选；与 segment_lengths 等长，每项 "
+                '{"min": 正整数, "max": 正整数} 且 min<=max、包含对应名义长度。'
+                "提交后启用稳健模式：每个观测窗必须对各段长度在各自区间内的"
+                "任意独立整数取值都满足累计伸长闭区间；未提交时行为与固定长度一致"
+            ),
             "strain_bounds": {"min": "整数微应变闭区间下端", "max": "上端"},
             "windows": [
                 {
@@ -51,11 +57,23 @@ async def schema_hint() -> dict:
             },
             "window_checks": [
                 {
-                    "weighted_strain_sum": "= Σ 窗内长度×应变，须落入提交的闭区间",
-                    "total_length": "= Σ 窗内段长",
-                    "satisfied": "min<=weighted_strain_sum<=max",
+                    "weighted_strain_sum": "= Σ 窗内名义长度×应变，须落入提交的闭区间",
+                    "total_length": "= Σ 窗内名义段长",
+                    "satisfied": (
+                        "固定长度模式：min<=weighted_strain_sum<=max；"
+                        "稳健模式：min<=min_possible 且 max_possible<=max"
+                    ),
+                    "min_possible_weighted_sum": (
+                        "仅稳健模式：按应变正负取长度端点推导的最小可能回算和（精确整数）"
+                    ),
+                    "max_possible_weighted_sum": "仅稳健模式：最大可能回算和",
+                    "lengths_at_min": (
+                        "仅稳健模式：取得最小和时窗内各段所用的长度端点（与窗内段一一对应）"
+                    ),
+                    "lengths_at_max": "仅稳健模式：取得最大和时窗内各段所用的长度端点",
                 }
             ],
+            "length_mode": "仅稳健模式出现，值为 interval；未提交长度区间时响应不含该字段",
             "criteria_order": [
                 "max_adjacent_diff",
                 "sum_adjacent_abs_diff",
@@ -64,7 +82,10 @@ async def schema_hint() -> dict:
         },
         "errors": {
             "INVALID_INPUT": {"fields": [{"field": "字段路径", "message": "原因"}]},
-            "INFEASIBLE": "观测窗彼此冲突，不存在满足全部闭区间的整数应变序列",
+            "INFEASIBLE": (
+                "观测窗彼此冲突（稳健模式下：无法对所有长度取值同时满足），"
+                "不存在满足全部闭区间的整数应变序列"
+            ),
         },
     }
 
